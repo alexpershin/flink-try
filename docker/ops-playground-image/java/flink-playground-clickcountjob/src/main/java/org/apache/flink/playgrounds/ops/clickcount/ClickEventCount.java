@@ -19,6 +19,7 @@ package org.apache.flink.playgrounds.ops.clickcount;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.playgrounds.ops.clickcount.functions.BackpressureMap;
 import org.apache.flink.playgrounds.ops.clickcount.functions.ClickEventStatisticsCollector;
@@ -35,10 +36,12 @@ import org.apache.flink.streaming.api.windowing.assigners.WindowAssigner;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.connector.jdbc.JdbcSink;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
@@ -57,89 +60,110 @@ import java.util.concurrent.TimeUnit;
  * * "--input-topic": the name of the Kafka Topic to consume {@link ClickEvent}s from
  * * "--output-topic": the name of the Kafka Topic to produce {@link ClickEventStatistics} to
  * * "--bootstrap.servers": comma-separated list of Kafka brokers
- *
  */
 public class ClickEventCount {
 
-	public static final String CHECKPOINTING_OPTION = "checkpointing";
-	public static final String EVENT_TIME_OPTION = "event-time";
-	public static final String BACKPRESSURE_OPTION = "backpressure";
-	public static final String OPERATOR_CHAINING_OPTION = "chaining";
+    public static final String CHECKPOINTING_OPTION = "checkpointing";
+    public static final String EVENT_TIME_OPTION = "event-time";
+    public static final String BACKPRESSURE_OPTION = "backpressure";
+    public static final String OPERATOR_CHAINING_OPTION = "chaining";
 
-	public static final Time WINDOW_SIZE = Time.of(15, TimeUnit.SECONDS);
+    public static final Time WINDOW_SIZE = Time.of(15, TimeUnit.SECONDS);
+    public static final String JDBC_URL = "jdbc:postgresql://postgres:5432/docker";
+    public static final String JDBC_PASSWORD = "docker";
+    public static final String JDBC_USER = "docker";
+    public static final String JDBC_DRIVER_CLASS = "org.postgresql.Driver";
 
-	public static void main(String[] args) throws Exception {
-		final ParameterTool params = ParameterTool.fromArgs(args);
+    public static void main(String[] args) throws Exception {
+        final ParameterTool params = ParameterTool.fromArgs(args);
 
-		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-		configureEnvironment(params, env);
+        configureEnvironment(params, env);
 
-		boolean inflictBackpressure = params.has(BACKPRESSURE_OPTION);
+        boolean inflictBackpressure = params.has(BACKPRESSURE_OPTION);
 
-		String inputTopic = params.get("input-topic", "input");
-		String outputTopic = params.get("output-topic", "output");
-		String brokers = params.get("bootstrap.servers", "localhost:9092");
-		Properties kafkaProps = new Properties();
-		kafkaProps.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
-		kafkaProps.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "click-event-count");
+        String inputTopic = params.get("input-topic", "input");
+        String outputTopic = params.get("output-topic", "output");
+        String brokers = params.get("bootstrap.servers", "localhost:9092");
+        Properties kafkaProps = new Properties();
+        kafkaProps.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
+        kafkaProps.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "click-event-count");
 
-		KafkaSource<ClickEvent> source = KafkaSource.<ClickEvent>builder()
-				.setTopics(inputTopic)
-				.setValueOnlyDeserializer(new ClickEventDeserializationSchema())
-				.setProperties(kafkaProps)
-				.build();
+        KafkaSource<ClickEvent> source = KafkaSource.<ClickEvent>builder()
+                .setTopics(inputTopic)
+                .setValueOnlyDeserializer(new ClickEventDeserializationSchema())
+                .setProperties(kafkaProps)
+                .build();
 
-		WatermarkStrategy<ClickEvent> watermarkStrategy = WatermarkStrategy
-				.<ClickEvent>forBoundedOutOfOrderness(Duration.ofMillis(200))
-				.withTimestampAssigner((clickEvent, l) -> clickEvent.getTimestamp().getTime());
+        WatermarkStrategy<ClickEvent> watermarkStrategy = WatermarkStrategy
+                .<ClickEvent>forBoundedOutOfOrderness(Duration.ofMillis(200))
+                .withTimestampAssigner((clickEvent, l) -> clickEvent.getTimestamp().getTime());
 
-		DataStream<ClickEvent> clicks = env.fromSource(source, watermarkStrategy, "ClickEvent Source");
+        DataStream<ClickEvent> clicks = env.fromSource(source, watermarkStrategy, "ClickEvent Source");
 
-		if (inflictBackpressure) {
-			// Force a network shuffle so that the backpressure will affect the buffer pools
-			clicks = clicks
-				.keyBy(ClickEvent::getPage)
-				.map(new BackpressureMap())
-				.name("Backpressure");
-		}
+        if (inflictBackpressure) {
+            // Force a network shuffle so that the backpressure will affect the buffer pools
+            clicks = clicks
+                    .keyBy(ClickEvent::getPage)
+                    .map(new BackpressureMap())
+                    .name("Backpressure");
+        }
 
-		WindowAssigner<Object, TimeWindow> assigner = params.has(EVENT_TIME_OPTION) ?
-				TumblingEventTimeWindows.of(WINDOW_SIZE) :
-				TumblingProcessingTimeWindows.of(WINDOW_SIZE);
+        WindowAssigner<Object, TimeWindow> assigner = params.has(EVENT_TIME_OPTION) ?
+                TumblingEventTimeWindows.of(WINDOW_SIZE) :
+                TumblingProcessingTimeWindows.of(WINDOW_SIZE);
 
-		DataStream<ClickEventStatistics> statistics = clicks
-			.keyBy(ClickEvent::getPage)
-			.window(assigner)
-			.aggregate(new CountingAggregator(),
-				new ClickEventStatisticsCollector())
-			.name("ClickEvent Counter");
+        DataStream<ClickEventStatistics> statistics = clicks
+                .keyBy(ClickEvent::getPage)
+                .window(assigner)
+                .aggregate(new CountingAggregator(),
+                        new ClickEventStatisticsCollector())
+                .name("ClickEvent Counter");
 
-		statistics
-			.addSink(new FlinkKafkaProducer<>(
-				outputTopic,
-				new ClickEventStatisticsSerializationSchema(outputTopic),
-				kafkaProps,
-				FlinkKafkaProducer.Semantic.AT_LEAST_ONCE))
-			.name("ClickEventStatistics Sink");
+//		statistics
+//			.addSink(new FlinkKafkaProducer<>(
+//				outputTopic,
+//				new ClickEventStatisticsSerializationSchema(outputTopic),
+//				kafkaProps,
+//				FlinkKafkaProducer.Semantic.AT_LEAST_ONCE))
+//			.name("ClickEventStatistics Sink");
 
-		env.execute("Click Event Count");
-	}
+        statistics
+                .addSink(JdbcSink.sink("INSERT INTO CLICK_EVENT_STATISTICS " +
+                                "(windowStart, windowEnd, page, count) " +
+                                "values (?,?,?,?)",
+                        (ps, t) -> {
+                            ps.setTimestamp(1, new Timestamp(t.getWindowStart().getTime()));
+                            ps.setTimestamp(2, new Timestamp(t.getWindowEnd().getTime()));
+                            ps.setString(3, t.getPage());
+                            ps.setLong(4, t.getCount());
+                        },
+                        new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                                .withUrl(JDBC_URL)
+                                .withPassword(JDBC_PASSWORD)
+                                .withUsername(JDBC_USER)
+                                .withDriverName(JDBC_DRIVER_CLASS)
+                                .build()
+                )).name("ClickEventStatistics Sink");
 
-	private static void configureEnvironment(
-			final ParameterTool params,
-			final StreamExecutionEnvironment env) {
+        env.execute("Click Event Count");
+    }
 
-		boolean checkpointingEnabled = params.has(CHECKPOINTING_OPTION);
-		boolean enableChaining = params.has(OPERATOR_CHAINING_OPTION);
+    private static void configureEnvironment(
+            final ParameterTool params,
+            final StreamExecutionEnvironment env) {
 
-		if (checkpointingEnabled) {
-			env.enableCheckpointing(1000);
-		}
+        boolean checkpointingEnabled = params.has(CHECKPOINTING_OPTION);
+        boolean enableChaining = params.has(OPERATOR_CHAINING_OPTION);
 
-		if(!enableChaining){
-			//disabling Operator chaining to make it easier to follow the Job in the WebUI
-			env.disableOperatorChaining();
-		}
-	}
+        if (checkpointingEnabled) {
+            env.enableCheckpointing(1000);
+        }
+
+        if (!enableChaining) {
+            //disabling Operator chaining to make it easier to follow the Job in the WebUI
+            env.disableOperatorChaining();
+        }
+    }
 }
